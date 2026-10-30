@@ -6,7 +6,7 @@
  * - OIDC discovery endpoint support
  * - Authorization code flow
  * - User provisioning (JIT - Just In Time)
- * - Frontend customization to show OIDC login button
+ * - Native n8n frontend SSO integration & fallback DOM injector
  *
  * Environment Variables Required:
  * - OIDC_ISSUER_URL: The OIDC provider's issuer URL (e.g., https://auth.example.com)
@@ -22,6 +22,81 @@ const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
 const { URL, URLSearchParams } = require('url');
+const { createRequire } = require('module');
+
+// Helper to resolve n8n internal modules across different n8n versions & layouts
+function resolveN8nModule(modulePath) {
+  try {
+    return require(modulePath);
+  } catch (e) {}
+
+  const roots = [
+    '/usr/local/lib/node_modules/n8n/dist/commands/start.js',
+    '/usr/local/lib/node_modules/n8n/package.json',
+  ];
+  for (const root of roots) {
+    try {
+      const n8nRequire = createRequire(root);
+      return n8nRequire(modulePath);
+    } catch (e) {}
+  }
+  return null;
+}
+
+function getN8nContainer() {
+  const candidates = [
+    '@n8n/di',
+    '/usr/local/lib/node_modules/n8n/node_modules/@n8n/di',
+    '/usr/local/lib/node_modules/@n8n/di',
+  ];
+  for (const c of candidates) {
+    const mod = resolveN8nModule(c);
+    if (mod && mod.Container) return mod.Container;
+  }
+  return null;
+}
+
+function getN8nJwtService() {
+  const candidates = [
+    '@n8n/backend-services',
+    '/usr/local/lib/node_modules/n8n/node_modules/@n8n/backend-services',
+    '/usr/local/lib/node_modules/@n8n/backend-services',
+    '/usr/local/lib/node_modules/n8n/dist/services/jwt.service.js',
+    '/usr/local/lib/node_modules/n8n/dist/auth/jwt.service.js',
+  ];
+  for (const c of candidates) {
+    const mod = resolveN8nModule(c);
+    if (mod) {
+      if (mod.JwtService) return mod.JwtService;
+      if (typeof mod === 'function' && mod.name === 'JwtService') return mod;
+    }
+  }
+  return null;
+}
+
+function getN8nAuthService() {
+  const candidates = [
+    '/usr/local/lib/node_modules/n8n/dist/auth/auth.service.js',
+    'n8n/dist/auth/auth.service.js',
+  ];
+  for (const c of candidates) {
+    const mod = resolveN8nModule(c);
+    if (mod && mod.AuthService) return mod.AuthService;
+  }
+  return null;
+}
+
+function getN8nAuthJwtHelper() {
+  const candidates = [
+    '/usr/local/lib/node_modules/n8n/dist/auth/jwt.js',
+    'n8n/dist/auth/jwt.js',
+  ];
+  for (const c of candidates) {
+    const mod = resolveN8nModule(c);
+    if (mod && (mod.issueCookie || mod.issueJWT)) return mod;
+  }
+  return null;
+}
 
 // Configuration from environment
 const config = {
@@ -58,12 +133,17 @@ function makeRequest(url, options = {}) {
     const parsedUrl = new URL(url);
     const protocol = parsedUrl.protocol === 'https:' ? https : http;
 
+    const headers = Object.assign({}, options.headers || {});
+    if (options.body && !headers['Content-Length'] && !headers['content-length']) {
+      headers['Content-Length'] = Buffer.byteLength(options.body);
+    }
+
     const reqOptions = {
       hostname: parsedUrl.hostname,
       port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
       path: parsedUrl.pathname + parsedUrl.search,
       method: options.method || 'GET',
-      headers: options.headers || {},
+      headers,
     };
 
     const req = protocol.request(reqOptions, (res) => {
@@ -172,16 +252,18 @@ async function exchangeCodeForTokens(code, discovery) {
     client_secret: config.clientSecret,
   });
 
+  const bodyString = params.toString();
   const response = await makeRequest(discovery.token_endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(bodyString),
     },
-    body: params.toString(),
+    body: bodyString,
   });
 
   if (response.statusCode !== 200) {
-    console.error('Token exchange failed:', response.body);
+    console.error('[OIDC Hook] Token exchange failed:', response.statusCode, response.body);
     throw new Error(`Token exchange failed: ${response.statusCode}`);
   }
 
@@ -202,7 +284,7 @@ async function fetchUserInfo(accessToken, discovery) {
   });
 
   if (response.statusCode !== 200) {
-    console.error('UserInfo fetch failed:', response.body);
+    console.error('[OIDC Hook] UserInfo fetch failed:', response.statusCode, response.body);
     throw new Error(`UserInfo fetch failed: ${response.statusCode}`);
   }
 
@@ -270,23 +352,6 @@ function getCookieSecret(context) {
 }
 
 /**
- * Create the n8n auth cookie using n8n's JwtService
- * @param {object} user
- * @param {object} jwtService - n8n's JwtService instance
- * @returns {string}
- */
-function createAuthToken(user, jwtService) {
-  // n8n's JWT contains: { id, hash, browserId?, usedMfa? }
-  const payload = {
-    id: user.id,
-    hash: createUserHash(user),
-    usedMfa: false,
-  };
-
-  return jwtService.sign(payload, { expiresIn: '7d' });
-}
-
-/**
  * Create user hash for JWT (mimics n8n's AuthService.createJWTHash)
  * @param {object} user
  * @returns {string}
@@ -300,6 +365,35 @@ function createUserHash(user) {
 }
 
 /**
+ * Create the n8n auth cookie using n8n's JwtService
+ * @param {object} user
+ * @param {object} jwtService - n8n's JwtService instance
+ * @returns {string}
+ */
+function createAuthToken(user, jwtService) {
+  // n8n's JWT contains: { id, hash, browserId?, usedMfa? }
+  const payload = {
+    id: user.id,
+    hash: createUserHash(user),
+    usedMfa: false,
+  };
+
+  try {
+    return jwtService.sign(payload, { expiresIn: '7d' });
+  } catch (err) {
+    try {
+      return jwtService.sign(payload, 'auth', { expiresIn: '7d' });
+    } catch (e1) {
+      try {
+        return jwtService.sign(payload, { expiresIn: '7d', purpose: 'auth' });
+      } catch (e2) {
+        throw err;
+      }
+    }
+  }
+}
+
+/**
  * Check if email is valid
  * @param {string} email
  * @returns {boolean}
@@ -309,16 +403,12 @@ function isValidEmail(email) {
   return emailRegex.test(email);
 }
 
-// n8n module paths (specific to the Docker image)
-const N8N_DI_PATH = '/usr/local/lib/node_modules/n8n/node_modules/@n8n/di';
-const N8N_JWT_SERVICE_PATH = '/usr/local/lib/node_modules/n8n/dist/services/jwt.service.js';
-
 // Export the hooks
 module.exports = {
   n8n: {
     /**
      * Called when n8n is ready
-     * We use this to register custom routes for OIDC
+     * We use this to register custom routes for OIDC and enable native SSO UI
      */
     ready: [
       async function (server, n8nConfig) {
@@ -330,16 +420,72 @@ module.exports = {
 
         console.log('[OIDC Hook] Initializing OIDC authentication...');
 
-        // Get n8n's JwtService from the DI container
-        const { Container } = require(N8N_DI_PATH);
-        const { JwtService } = require(N8N_JWT_SERVICE_PATH);
-        const jwtService = Container.get(JwtService);
+        // Configure frontendService to report OIDC is licensed & active
+        if (server && server.frontendService) {
+          console.log('[OIDC Hook] Patching frontendService to enable native SSO UI');
+
+          if (server.frontendService.licenseState) {
+            server.frontendService.licenseState.isOidcLicensed = () => true;
+          }
+
+          const origGetPublicSettings = server.frontendService.getPublicSettings.bind(server.frontendService);
+          server.frontendService.getPublicSettings = async function (includeMfa) {
+            const settings = await origGetPublicSettings(includeMfa);
+            if (settings) {
+              if (settings.userManagement) {
+                settings.userManagement.authenticationMethod = 'oidc';
+              }
+              if (settings.enterprise) {
+                settings.enterprise.oidc = true;
+              }
+              if (settings.sso) {
+                settings.sso.oidc = settings.sso.oidc || {};
+                settings.sso.oidc.loginEnabled = true;
+                settings.sso.oidc.loginUrl = '/auth/oidc/login';
+              }
+            }
+            return settings;
+          };
+
+          const origGetSettings = server.frontendService.getSettings.bind(server.frontendService);
+          server.frontendService.getSettings = async function () {
+            const settings = await origGetSettings();
+            if (settings) {
+              if (settings.userManagement) {
+                settings.userManagement.authenticationMethod = 'oidc';
+              }
+              if (settings.enterprise) {
+                settings.enterprise.oidc = true;
+              }
+              if (settings.sso) {
+                settings.sso.oidc = settings.sso.oidc || {};
+                settings.sso.oidc.loginEnabled = true;
+                settings.sso.oidc.loginUrl = '/auth/oidc/login';
+              }
+            }
+            return settings;
+          };
+        }
+
+        // Setup authentication helper references safely (pre-load or lazy fallback)
+        let Container = null;
+        let jwtService = null;
+        try {
+          Container = getN8nContainer();
+          const JwtServiceClass = getN8nJwtService();
+          if (Container && JwtServiceClass) {
+            jwtService = Container.get(JwtServiceClass);
+          }
+        } catch (e) {
+          console.warn('[OIDC Hook] Warning: could not preload JwtService at startup:', e.message);
+        }
 
         const { app } = server;
         const cookieSecret = getCookieSecret();
 
         // Cookie settings
         const cookieOptions = {
+          path: '/',
           httpOnly: true,
           secure: process.env.N8N_PROTOCOL === 'https',
           sameSite: 'lax',
@@ -347,6 +493,7 @@ module.exports = {
         };
 
         const authCookieOptions = {
+          path: '/',
           httpOnly: true,
           secure: process.env.N8N_PROTOCOL === 'https',
           sameSite: 'lax',
@@ -395,7 +542,7 @@ module.exports = {
 
             // Handle OIDC errors
             if (error) {
-              console.error('[OIDC Hook] OIDC error:', error, error_description);
+              console.error('[OIDC Hook] OIDC error from provider:', error, error_description);
               return res.redirect('/signin?error=' + encodeURIComponent(error_description || error));
             }
 
@@ -419,8 +566,8 @@ module.exports = {
             }
 
             // Clear state cookies
-            res.clearCookie('n8n-oidc-state');
-            res.clearCookie('n8n-oidc-nonce');
+            res.clearCookie('n8n-oidc-state', cookieOptions);
+            res.clearCookie('n8n-oidc-nonce', cookieOptions);
 
             // Exchange code for tokens
             const discovery = await fetchDiscoveryDocument();
@@ -452,12 +599,14 @@ module.exports = {
               return res.redirect('/signin?error=' + encodeURIComponent('No valid email in OIDC response'));
             }
 
+            const email = userInfo.email.trim().toLowerCase();
+
             // Find or create user in n8n database
-            const { User, Settings, Credentials, Workflow } = this.dbCollections;
+            const { User } = this.dbCollections;
 
             // Try to find existing user by email
             let user = await User.findOne({
-              where: { email: userInfo.email },
+              where: { email },
               relations: ['role'],
             });
 
@@ -466,7 +615,7 @@ module.exports = {
               const userCount = await User.count();
 
               const userData = {
-                email: userInfo.email,
+                email,
                 firstName: userInfo.given_name || userInfo.name?.split(' ')[0] || 'User',
                 lastName: userInfo.family_name || userInfo.name?.split(' ').slice(1).join(' ') || '',
                 password: crypto.randomBytes(32).toString('hex'), // Random password, can't be used
@@ -477,18 +626,80 @@ module.exports = {
               const result = await User.createUserWithProject(userData);
               user = result.user;
 
-              console.log(`[OIDC Hook] Created ${userCount === 0 ? 'owner' : 'member'} user with personal project: ${userInfo.email}`);
+              console.log(`[OIDC Hook] Created ${userCount === 0 ? 'owner' : 'member'} user with personal project: ${email}`);
             }
 
             if (!user) {
               return res.redirect('/signin?error=' + encodeURIComponent('Failed to create or find user'));
             }
 
-            // Create auth token using n8n's JwtService
-            const authToken = createAuthToken(user, jwtService);
+            // Create auth token / cookie using n8n's AuthService, JwtService, or JWT helper
+            let authToken = null;
+            let cookieIssued = false;
 
-            // Set the n8n auth cookie
-            res.cookie('n8n-auth', authToken, authCookieOptions);
+            // Strategy 1: AuthService from DI Container
+            try {
+              if (!Container) Container = getN8nContainer();
+              const AuthServiceClass = getN8nAuthService();
+              if (Container && AuthServiceClass) {
+                const authService = Container.get(AuthServiceClass);
+                if (authService) {
+                  if (typeof authService.issueCookie === 'function') {
+                    authService.issueCookie(res, user);
+                    cookieIssued = true;
+                  } else if (typeof authService.issueJWT === 'function') {
+                    authToken = authService.issueJWT(user, false, req.browserId);
+                  }
+                }
+              }
+            } catch (authErr) {
+              console.warn('[OIDC Hook] AuthService issuance failed:', authErr.message);
+            }
+
+            // Strategy 2: auth/jwt helper (issueCookie)
+            if (!cookieIssued && !authToken) {
+              try {
+                const jwtHelper = getN8nAuthJwtHelper();
+                if (jwtHelper) {
+                  if (typeof jwtHelper.issueCookie === 'function') {
+                    jwtHelper.issueCookie(res, user);
+                    cookieIssued = true;
+                  } else if (typeof jwtHelper.issueJWT === 'function') {
+                    authToken = jwtHelper.issueJWT(user, false, req.browserId);
+                  }
+                }
+              } catch (jwtHelperErr) {
+                console.warn('[OIDC Hook] auth/jwt helper failed:', jwtHelperErr.message);
+              }
+            }
+
+            // Strategy 3: JwtService from Container
+            if (!cookieIssued && !authToken) {
+              try {
+                if (!jwtService) {
+                  if (!Container) Container = getN8nContainer();
+                  const JwtServiceClass = getN8nJwtService();
+                  if (Container && JwtServiceClass) {
+                    jwtService = Container.get(JwtServiceClass);
+                  }
+                }
+                if (jwtService) {
+                  authToken = createAuthToken(user, jwtService);
+                }
+              } catch (jwtErr) {
+                console.warn('[OIDC Hook] JwtService creation failed:', jwtErr.message);
+              }
+            }
+
+            // If cookie was not directly set by issueCookie, set it now
+            if (!cookieIssued) {
+              if (!authToken) {
+                throw new Error('Could not generate n8n session token (all authentication providers failed)');
+              }
+              res.cookie('n8n-auth', authToken, authCookieOptions);
+            }
+
+            console.log(`[OIDC Hook] Successfully authenticated ${user.email} (${user.id}), redirecting to /`);
 
             // Redirect to home
             res.redirect('/');
@@ -500,7 +711,7 @@ module.exports = {
 
         /**
          * Serve the frontend customization script
-         * This script will replace the login form with an OIDC button
+         * This script acts as a robust fallback to ensure the SSO button is displayed
          *
          * NOTE: The route must be under /assets/ or another non-UI route prefix
          * to avoid being intercepted by n8n's history API handler which would
@@ -509,7 +720,7 @@ module.exports = {
         app.get('/assets/oidc-frontend-hook.js', (req, res) => {
           // Use res.type() for proper MIME type handling with nosniff
           res.type('text/javascript; charset=utf-8');
-          res.set('Cache-Control', 'public, max-age=3600');
+          res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
           res.send(getFrontendScript());
         });
 
@@ -533,7 +744,6 @@ module.exports = {
         }
 
         // Enable OIDC login button by setting these properties
-        // This tells the frontend that OIDC is available
         frontendSettings.sso = frontendSettings.sso || {};
         frontendSettings.sso.oidc = {
           loginEnabled: true,
@@ -557,14 +767,16 @@ module.exports = {
 
 /**
  * Generate the frontend customization script
- * This script runs in the browser and customizes the login page
+ * This script runs in the browser and provides a robust fallback for the SSO button
  */
 function getFrontendScript() {
   return `
 /**
  * n8n OIDC Frontend Customization
  *
- * This script surgically modifies the login form to show an SSO button.
+ * This script ensures the SSO button is visible.
+ * Primary mechanism: Native n8n SSO UI enabled via server.frontendService patch.
+ * Fallback mechanism: DOM injection if native SSO UI is not rendered.
  * To access the normal login form, add ?showLogin=true to the URL.
  */
 (function() {
@@ -575,44 +787,45 @@ function getFrontendScript() {
 	}
 
 	function isSigninPage() {
-		return window.location.pathname === '/signin' || window.location.pathname === '/login';
+		return window.location.pathname.startsWith('/signin') ||
+			window.location.pathname.startsWith('/login') ||
+			!!document.querySelector('[data-test-id="form-submit-button"]') ||
+			!!document.querySelector('[data-test-id="signin-form"]');
 	}
 
-	function displayError(form) {
+	function displayError(container) {
 		var error = new URLSearchParams(window.location.search).get('error');
-		if (!error || !form || form.querySelector('#oidc-error')) return;
+		if (!error || !container || container.querySelector('#oidc-error')) return;
 
 		var errorDiv = document.createElement('div');
 		errorDiv.id = 'oidc-error';
 		errorDiv.style.cssText = 'background: var(--color-danger-tint-1, #fee); border: 1px solid var(--color-danger, #fcc); color: var(--color-danger, #c00); padding: 12px; border-radius: 4px; margin: 16px 0;';
 		errorDiv.textContent = decodeURIComponent(error);
 
-		var heading = form.querySelector('div[class*="_heading_"]');
+		var heading = container.querySelector('div[class*="_heading_"], div[class*="heading"], h1, h2');
 		if (heading) heading.after(errorDiv);
-		else form.prepend(errorDiv);
+		else container.prepend(errorDiv);
 	}
 
 	function injectSsoButton() {
 		if (shouldShowNormalLogin()) return;
-		if (!isSigninPage()) return;
+		if (document.querySelector('[data-test-id="sso-login-button"]') || document.querySelector('#oidc-sso-button')) return;
 
-		var form = document.querySelector('[data-test-id="auth-form"]');
-		if (!form || form.querySelector('#oidc-sso-button')) return;
+		var submitBtn = document.querySelector('[data-test-id="form-submit-button"]');
+		var form = document.querySelector('[data-test-id="auth-form"]') ||
+			(submitBtn && (submitBtn.closest('.n8n-form-box') || submitBtn.closest('div[class*="container"]') || submitBtn.closest('form'))) ||
+			document.querySelector('[data-test-id="signin-form"]');
+		if (!form) return;
 
-		// Find existing button to clone its classes
-		var existingButton = form.querySelector('[data-test-id="form-submit-button"]');
-		var buttonClasses = existingButton ? existingButton.className : '';
+		var buttonClasses = submitBtn ? submitBtn.className : '';
 
-		// Hide the form elements (inputs, buttons, forgot password)
-		form.querySelectorAll('div[class*="_inputsContainer_"], div[class*="_buttonsContainer_"], div[class*="_actionContainer_"]')
+		form.querySelectorAll('div[class*="_inputsContainer_"], div[class*="_buttonsContainer_"], div[class*="_actionContainer_"], div[class*="inputsContainer"], div[class*="buttonsContainer"], div[class*="actionContainer"]')
 			.forEach(function(el) { el.style.display = 'none'; });
 
-		// Create SSO button container
 		var ssoContainer = document.createElement('div');
 		ssoContainer.id = 'oidc-sso-container';
-		ssoContainer.style.cssText = 'text-align: center;';
+		ssoContainer.style.cssText = 'text-align: center; margin-top: 16px;';
 
-		// Create button - use cloned classes or fallback styles
 		var button = document.createElement('button');
 		button.id = 'oidc-sso-button';
 		button.type = 'button';
@@ -626,7 +839,6 @@ function getFrontendScript() {
 			button.style.cssText = 'width: 100%; padding: 12px 24px; font-size: 14px; font-weight: 600; color: white; background: var(--color-primary, #ea4b30); border: none; border-radius: 4px; cursor: pointer;';
 		}
 
-		// Create admin link
 		var adminLink = document.createElement('p');
 		adminLink.style.cssText = 'margin-top: 16px; font-size: 12px; color: var(--color-text-light, #666);';
 		adminLink.innerHTML = 'Admin? <a href="?showLogin=true" style="color: var(--color-primary, #ea4b30);">Sign in with email</a>';
@@ -634,8 +846,7 @@ function getFrontendScript() {
 		ssoContainer.appendChild(button);
 		ssoContainer.appendChild(adminLink);
 
-		// Insert after the heading
-		var heading = form.querySelector('div[class*="_heading_"]');
+		var heading = form.querySelector('div[class*="_heading_"], div[class*="heading"], h1, h2');
 		if (heading) heading.after(ssoContainer);
 		else form.prepend(ssoContainer);
 
@@ -643,21 +854,18 @@ function getFrontendScript() {
 	}
 
 	function observeAndInject() {
-		if (shouldShowNormalLogin() || !isSigninPage()) return;
-
+		if (shouldShowNormalLogin()) return;
 		injectSsoButton();
 
-		var observer = new MutationObserver(function() {
-			if (isSigninPage() && !shouldShowNormalLogin()) {
-				var form = document.querySelector('[data-test-id="auth-form"]');
-				if (form && !form.querySelector('#oidc-sso-button')) {
+		if (!window.__oidcObserverAttached) {
+			window.__oidcObserverAttached = true;
+			var observer = new MutationObserver(function() {
+				if (!shouldShowNormalLogin() && isSigninPage()) {
 					injectSsoButton();
 				}
-			}
-		});
-
-		observer.observe(document.body, { childList: true, subtree: true });
-		setTimeout(function() { observer.disconnect(); }, 10000);
+			});
+			observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
+		}
 	}
 
 	function handleNavigation() {
@@ -666,16 +874,20 @@ function getFrontendScript() {
 
 		history.pushState = function() {
 			origPush.apply(this, arguments);
-			setTimeout(observeAndInject, 100);
+			setTimeout(observeAndInject, 50);
+			setTimeout(observeAndInject, 200);
+			setTimeout(observeAndInject, 500);
 		};
 
 		history.replaceState = function() {
 			origReplace.apply(this, arguments);
-			setTimeout(observeAndInject, 100);
+			setTimeout(observeAndInject, 50);
+			setTimeout(observeAndInject, 200);
+			setTimeout(observeAndInject, 500);
 		};
 
 		window.addEventListener('popstate', function() {
-			setTimeout(observeAndInject, 100);
+			setTimeout(observeAndInject, 50);
 		});
 	}
 
@@ -689,8 +901,9 @@ function getFrontendScript() {
 		handleNavigation();
 	}
 
+	setTimeout(observeAndInject, 100);
 	setTimeout(observeAndInject, 500);
-	setTimeout(observeAndInject, 1000);
+	setTimeout(observeAndInject, 1500);
 
 	console.log('[OIDC Hook] Frontend customization loaded');
 })();
